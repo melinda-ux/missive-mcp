@@ -192,24 +192,28 @@ export interface PostResponse {
 }
 
 // Comment
+// Note: `mentions` is index/length reference data (per Missive's docs), not full
+// user objects — just enough to locate the mention in the body text and identify
+// who it points at via `id`.
+export interface CommentMention {
+  id: string;
+  index?: number;
+  length?: number;
+}
+
 export interface Comment {
   id: string;
   body?: string;
   author?: User;
   conversation?: string;
   created_at: number;
-  mentions?: User[];
+  mentions?: CommentMention[];
   attachments?: Attachment[];
   task?: {
     id: string;
     completed?: boolean;
   };
 }
-
-export interface CommentsResponse {
-  comments: Comment[];
-}
-
 // Timeline item - discriminated union for unified conversation view
 export type TimelineItem =
   | { type: 'message'; data: Message; timestamp: number }
