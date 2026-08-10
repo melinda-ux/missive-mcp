@@ -179,30 +179,47 @@ Requires the person's email address (looked up against Missive's user list, cach
                 break;
               }
 
-              const commentsData = await client.get<CommentsResponse>(
-                `/conversations/${convo.id}/comments`,
-                { limit: 20 }
-              );
+              // /comments is a sub-resource endpoint capped at limit=10 (unlike
+              // the top-level /conversations list, which allows up to 50), so
+              // page through it until we're past the cutoff or run out.
+              let commentsUntil: string | undefined;
+              let keepPagingComments = true;
 
-              for (const comment of commentsData.comments) {
-                if (comment.created_at < sinceCutoff) continue;
-                const wasMentioned = comment.mentions?.some((m) => m.id === userId);
-                if (wasMentioned) {
-                  mentions.push({
-                    conversation_id: convo.id,
-                    conversation_subject: convo.subject || convo.latest_message_subject,
-                    comment_id: comment.id,
-                    comment_body: comment.body,
-                    author: comment.author
-                      ? {
-                          id: comment.author.id,
-                          name: comment.author.name,
-                          email: comment.author.email,
-                        }
-                      : undefined,
-                    created_at: comment.created_at,
-                  });
+              while (keepPagingComments) {
+                const commentsData = await client.get<CommentsResponse>(
+                  `/conversations/${convo.id}/comments`,
+                  { limit: 10, until: commentsUntil }
+                );
+
+                if (commentsData.comments.length === 0) break;
+
+                for (const comment of commentsData.comments) {
+                  if (comment.created_at < sinceCutoff) {
+                    keepPagingComments = false;
+                    continue;
+                  }
+                  const wasMentioned = comment.mentions?.some((m) => m.id === userId);
+                  if (wasMentioned) {
+                    mentions.push({
+                      conversation_id: convo.id,
+                      conversation_subject: convo.subject || convo.latest_message_subject,
+                      comment_id: comment.id,
+                      comment_body: comment.body,
+                      author: comment.author
+                        ? {
+                            id: comment.author.id,
+                            name: comment.author.name,
+                            email: comment.author.email,
+                          }
+                        : undefined,
+                      created_at: comment.created_at,
+                    });
+                  }
                 }
+
+                if (!keepPagingComments || commentsData.comments.length < 10) break;
+                const lastComment = commentsData.comments[commentsData.comments.length - 1];
+                commentsUntil = String(lastComment.created_at);
               }
             }
 
