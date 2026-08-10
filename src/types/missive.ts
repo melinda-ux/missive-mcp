@@ -194,12 +194,13 @@ export interface PostResponse {
 }
 
 // Comment
-// Note: `mentions` is index/length reference data (per Missive's docs), not full
-// user objects — just enough to locate the mention in the body text and identify
-// who it points at via `id`.
+// Note: `mentions` is offset/length reference data locating the @-mention in the
+// comment body, plus the mentioned user's ID — not a full user object. Confirmed
+// against live API responses: { length, offset, user_id }, NOT { id, index, length }
+// as Missive's own docs summary implies.
 export interface CommentMention {
-  id: string;
-  index?: number;
+  user_id: string;
+  offset?: number;
   length?: number;
 }
 
