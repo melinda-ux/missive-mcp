@@ -20,6 +20,7 @@ import { registerMessageTools } from './tools/messages.js';
 import { registerDraftTools } from './tools/drafts.js';
 import { registerContactTools } from './tools/contacts.js';
 import { registerManagementTools } from './tools/management.js';
+import { registerMentionTools } from './tools/mentions.js';
 
 async function main() {
   // Validate token on startup (fail fast)
@@ -56,6 +57,7 @@ async function main() {
   registerDraftTools(server, resolveClient);
   registerContactTools(server, resolveClient);
   registerManagementTools(server, resolveClient);
+  registerMentionTools(server, resolveClient);
 
   // Connect via stdio
   const transport = new StdioServerTransport();
