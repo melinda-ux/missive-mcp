@@ -13,12 +13,14 @@ const BASE_URL = 'https://public.missiveapp.com/v1';
 const REQUEST_TIMEOUT = 30000;
 
 // Missive's documented limits: 300 requests/min (5/sec), 900/15min, 5 concurrent.
-// For continuous polling (which is what mentions-scanning and any multi-conversation
-// tool call does) Missive's own guidance is to stay around 1 request/second rather
-// than bursting near the ceiling — bursting invites 429s under real-world jitter,
-// especially now that more than one client (ClickUp, Jarvis, ...) can call this
-// server against the same token.
-const MIN_REQUEST_INTERVAL_MS = 1000;
+// A strict 1 request/sec pace (Missive's guidance for *sustained* continuous
+// polling) turned out to be too conservative for tools like list_unanswered_mentions
+// that fire off several dozen requests in one short burst rather than polling
+// continuously — at 1/sec that burst alone could take 60-90+ seconds and trip
+// client-side timeouts. 250ms (~4/sec) stays comfortably under both the 5/sec
+// burst ceiling and the 300/min sustained cap for any realistic single-tool-call
+// burst, while cutting worst-case scan time by 4x.
+const MIN_REQUEST_INTERVAL_MS = 250;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const DEFAULT_RETRY_AFTER_SECONDS = 5;
 
