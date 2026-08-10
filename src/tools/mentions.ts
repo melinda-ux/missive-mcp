@@ -1,16 +1,19 @@
 /**
- * Mention tools: detect @-mentions of a specific person across recent conversations
+ * Mention tools: detect @-mentions of a specific person across recent conversations,
+ * and flag which ones they haven't followed up on yet.
  *
  * Missive's API has no webhook and no dedicated "mentions" filter — mentions are
  * only exposed as index/length reference data on individual comment objects
  * (comments are the internal team sidebar discussions, distinct from the emails
- * themselves). To find "was I mentioned recently," this tool polls: it walks
- * recently-active conversations and checks each one's recent comments for a
- * mention of the given person, within a lookback window the caller controls.
+ * themselves). To find "was I mentioned recently, and did I ignore it," this tool
+ * polls: it walks recently-active conversations, collects comments and messages
+ * within a lookback window, and for each mention checks whether the mentioned
+ * person posted a comment or sent a message in that conversation afterward.
  *
- * This is meant to be driven by an external scheduler (e.g. a ClickUp Super
- * Agent trigger running every 15-60 minutes) rather than called ad hoc — there
- * is no push mechanism to build on, so *something* has to poll on a cadence.
+ * Meant to be run on a schedule that's much lighter than a typical polling
+ * job — e.g. once a day, since the point isn't "notify me instantly" but "catch
+ * anything I missed." A longer since_minutes on Mondays (to cover the weekend)
+ * is just a different argument to the same tool, not a separate code path.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -22,6 +25,9 @@ import type {
   TeamsResponse,
   ConversationsResponse,
   CommentsResponse,
+  MessagesResponse,
+  Comment,
+  Message,
 } from '../types/missive.js';
 import type { MissiveClient } from '../client.js';
 
@@ -66,23 +72,99 @@ async function resolveUserId(
   return null;
 }
 
+/**
+ * Fetch every comment on a conversation with created_at >= sinceCutoff.
+ * /comments is a sub-resource endpoint capped at limit=10 (unlike the
+ * top-level /conversations list, which allows up to 50), so this pages
+ * through it with the `until` cursor.
+ */
+async function fetchCommentsSince(
+  client: MissiveClient,
+  conversationId: string,
+  sinceCutoff: number
+): Promise<Comment[]> {
+  const collected: Comment[] = [];
+  let until: string | undefined;
+
+  while (true) {
+    const data = await client.get<CommentsResponse>(`/conversations/${conversationId}/comments`, {
+      limit: 10,
+      until,
+    });
+
+    if (data.comments.length === 0) break;
+
+    let hitCutoff = false;
+    for (const comment of data.comments) {
+      if (comment.created_at < sinceCutoff) {
+        hitCutoff = true;
+        continue;
+      }
+      collected.push(comment);
+    }
+
+    if (hitCutoff || data.comments.length < 10) break;
+    until = String(data.comments[data.comments.length - 1].created_at);
+  }
+
+  return collected;
+}
+
+/**
+ * Fetch every message on a conversation with delivered_at >= sinceCutoff.
+ * Same sub-resource limit=10 cap and pagination approach as comments.
+ */
+async function fetchMessagesSince(
+  client: MissiveClient,
+  conversationId: string,
+  sinceCutoff: number
+): Promise<Message[]> {
+  const collected: Message[] = [];
+  let until: string | undefined;
+
+  while (true) {
+    const data = await client.get<MessagesResponse>(`/conversations/${conversationId}/messages`, {
+      limit: 10,
+      until,
+    });
+
+    if (data.messages.length === 0) break;
+
+    let hitCutoff = false;
+    for (const message of data.messages) {
+      const deliveredAt = message.delivered_at || 0;
+      if (deliveredAt < sinceCutoff) {
+        hitCutoff = true;
+        continue;
+      }
+      collected.push(message);
+    }
+
+    if (hitCutoff || data.messages.length < 10) break;
+    const last = data.messages[data.messages.length - 1];
+    until = String(last.delivered_at || 0);
+  }
+
+  return collected;
+}
+
 export function registerMentionTools(server: McpServer, getClient: ClientResolver): void {
   server.registerTool(
-    'list_recent_mentions',
+    'list_unanswered_mentions',
     {
-      title: 'List Recent Mentions',
-      description: `Finds recent @-mentions of a specific person in Missive comments (the internal team sidebar discussions on a conversation — NOT the emails/messages themselves).
+      title: 'List Unanswered Mentions',
+      description: `Finds @-mentions of a specific person in Missive comments (the internal team sidebar discussions on a conversation — NOT the emails themselves) that they have NOT yet followed up on, within a lookback window.
 
-Missive's API has no webhook or "mentions" filter, so this tool polls: it scans recently-active conversations and checks their comments for a mention of the given person, within a lookback window you control.
+Missive's API has no webhook or "mentions" filter, so this tool polls: it scans recently-active conversations, collects comments and messages within the window, and for each mention checks whether the mentioned person posted a comment or sent a message in that same conversation afterward. If they did, it's considered answered and left out. If not, it's surfaced as needing attention.
 
-Meant to be called on a repeating schedule (e.g. a Super Agent trigger every 15-60 minutes), with since_minutes set a bit longer than the polling interval so nothing falls through the gap between runs. Seeing the same mention across two consecutive runs is expected and harmless — dedupe on comment_id if you need to avoid re-notifying.
+Meant for an infrequent check (e.g. once a day, or once after a weekend with a longer since_minutes) rather than a tight polling loop — the point is catching things that got buried, not instant notification. Set since_minutes to cover however far back you want to check (e.g. 1440 for a daily run, ~4320 to also cover a weekend on Mondays).
 
-Requires the person's email address (looked up against Missive's user list, cached for an hour). Optionally scope to one organization; otherwise every organization this token can see is scanned.`,
+Requires the person's email address (looked up against Missive's user list, cached for an hour). Optionally scope to one organization; otherwise every organization this token can see is scanned — and every team within it, each with its own scan budget, so one busy team can't crowd out the others.`,
       inputSchema: {
         user_email: z
           .string()
           .email()
-          .describe('Email address of the person to check mentions for'),
+          .describe('Email address of the person to check unanswered mentions for'),
         organization: z
           .string()
           .uuid()
@@ -92,21 +174,26 @@ Requires the person's email address (looked up against Missive's user list, cach
           ),
         since_minutes: z
           .number()
-          .min(5)
-          .max(1440)
-          .default(120)
-          .describe('How far back to look, in minutes (default 2 hours)'),
-        max_conversations: z
+          .min(30)
+          .max(10080)
+          .default(1440)
+          .describe(
+            'How far back to look, in minutes (default 1440 = 24 hours; use something like 4320 on a Monday to also cover the weekend)'
+          ),
+        max_conversations_per_team: z
           .number()
           .min(1)
-          .max(100)
-          .default(40)
-          .describe('Maximum number of recently-active conversations to scan (caps latency/API calls)'),
+          .max(50)
+          .default(15)
+          .describe(
+            'Maximum recently-active conversations to scan PER TEAM (each team gets its own budget, so a busy team can\'t starve others out of being checked at all)'
+          ),
       },
     },
-    async ({ user_email, organization, since_minutes, max_conversations }, extra) => {
+    async ({ user_email, organization, since_minutes, max_conversations_per_team }, extra) => {
       const client = getClient(extra);
       const sinceCutoff = Math.floor(Date.now() / 1000) - since_minutes * 60;
+      const now = Math.floor(Date.now() / 1000);
 
       let organizationIds: string[];
       if (organization) {
@@ -129,37 +216,41 @@ Requires the person's email address (looked up against Missive's user list, cach
         };
       }
 
-      const mentions: Array<{
+      const unanswered: Array<{
         conversation_id: string;
         conversation_subject?: string;
+        conversation_url?: string;
         comment_id: string;
         comment_body?: string;
-        author?: { id: string; name?: string; email?: string };
-        created_at: number;
+        mentioned_by?: { id: string; name?: string; email?: string };
+        mentioned_at: number;
+        hours_since_mention: number;
       }> = [];
 
       let conversationsScanned = 0;
+      let teamsScanned = 0;
 
       // Missive's /conversations endpoint requires an actual mailbox filter —
       // `organization` alone isn't accepted ("You need to specify at least one
       // mailbox"). `team_all` is the documented way to scope to a shared team
       // inbox, but it takes exactly one team ID at a time, so we enumerate teams
-      // per organization and scan each team's "all" mailbox in turn.
+      // per organization and scan each team's "all" mailbox in turn. Each team
+      // gets its own max_conversations_per_team budget so a busy team can't
+      // crowd out quieter ones later in the list.
       for (const organizationId of organizationIds) {
-        if (conversationsScanned >= max_conversations) break;
-
         const teamsData = await client.get<TeamsResponse>('/teams', {
           organization: organizationId,
           limit: 200,
         });
 
         for (const team of teamsData.teams) {
-          if (conversationsScanned >= max_conversations) break;
+          teamsScanned++;
+          let scannedInTeam = 0;
 
           let until: string | undefined;
           let keepPaging = true;
 
-          while (keepPaging && conversationsScanned < max_conversations) {
+          while (keepPaging && scannedInTeam < max_conversations_per_team) {
             const data = await client.get<ConversationsResponse>('/conversations', {
               team_all: team.id,
               limit: 50,
@@ -169,7 +260,8 @@ Requires the person's email address (looked up against Missive's user list, cach
             if (data.conversations.length === 0) break;
 
             for (const convo of data.conversations) {
-              if (conversationsScanned >= max_conversations) break;
+              if (scannedInTeam >= max_conversations_per_team) break;
+              scannedInTeam++;
               conversationsScanned++;
 
               // Conversations come back newest-activity-first, so once we cross
@@ -179,47 +271,42 @@ Requires the person's email address (looked up against Missive's user list, cach
                 break;
               }
 
-              // /comments is a sub-resource endpoint capped at limit=10 (unlike
-              // the top-level /conversations list, which allows up to 50), so
-              // page through it until we're past the cutoff or run out.
-              let commentsUntil: string | undefined;
-              let keepPagingComments = true;
+              const [commentsInWindow, messagesInWindow] = await Promise.all([
+                fetchCommentsSince(client, convo.id, sinceCutoff),
+                fetchMessagesSince(client, convo.id, sinceCutoff),
+              ]);
 
-              while (keepPagingComments) {
-                const commentsData = await client.get<CommentsResponse>(
-                  `/conversations/${convo.id}/comments`,
-                  { limit: 10, until: commentsUntil }
+              for (const comment of commentsInWindow) {
+                const wasMentioned = comment.mentions?.some((m) => m.id === userId);
+                if (!wasMentioned) continue;
+
+                const repliedWithComment = commentsInWindow.some(
+                  (c) => c.author?.id === userId && c.created_at > comment.created_at
+                );
+                const repliedWithMessage = messagesInWindow.some(
+                  (m) =>
+                    m.from_field?.address?.toLowerCase() === user_email.toLowerCase() &&
+                    (m.delivered_at || 0) > comment.created_at
                 );
 
-                if (commentsData.comments.length === 0) break;
+                if (repliedWithComment || repliedWithMessage) continue;
 
-                for (const comment of commentsData.comments) {
-                  if (comment.created_at < sinceCutoff) {
-                    keepPagingComments = false;
-                    continue;
-                  }
-                  const wasMentioned = comment.mentions?.some((m) => m.id === userId);
-                  if (wasMentioned) {
-                    mentions.push({
-                      conversation_id: convo.id,
-                      conversation_subject: convo.subject || convo.latest_message_subject,
-                      comment_id: comment.id,
-                      comment_body: comment.body,
-                      author: comment.author
-                        ? {
-                            id: comment.author.id,
-                            name: comment.author.name,
-                            email: comment.author.email,
-                          }
-                        : undefined,
-                      created_at: comment.created_at,
-                    });
-                  }
-                }
-
-                if (!keepPagingComments || commentsData.comments.length < 10) break;
-                const lastComment = commentsData.comments[commentsData.comments.length - 1];
-                commentsUntil = String(lastComment.created_at);
+                unanswered.push({
+                  conversation_id: convo.id,
+                  conversation_subject: convo.subject || convo.latest_message_subject,
+                  conversation_url: convo.web_url,
+                  comment_id: comment.id,
+                  comment_body: comment.body,
+                  mentioned_by: comment.author
+                    ? {
+                        id: comment.author.id,
+                        name: comment.author.name,
+                        email: comment.author.email,
+                      }
+                    : undefined,
+                  mentioned_at: comment.created_at,
+                  hours_since_mention: Math.round(((now - comment.created_at) / 3600) * 10) / 10,
+                });
               }
             }
 
@@ -230,7 +317,7 @@ Requires the person's email address (looked up against Missive's user list, cach
         }
       }
 
-      mentions.sort((a, b) => b.created_at - a.created_at);
+      unanswered.sort((a, b) => b.mentioned_at - a.mentioned_at);
 
       return {
         content: [
@@ -240,9 +327,11 @@ Requires the person's email address (looked up against Missive's user list, cach
               {
                 user_email,
                 since_minutes,
+                max_conversations_per_team,
+                teams_scanned: teamsScanned,
                 conversations_scanned: conversationsScanned,
-                mentions_found: mentions.length,
-                mentions,
+                unanswered_mentions_found: unanswered.length,
+                unanswered_mentions: unanswered,
               },
               null,
               2
