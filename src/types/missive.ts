@@ -214,6 +214,11 @@ export interface Comment {
     completed?: boolean;
   };
 }
+
+export interface CommentsResponse {
+  comments: Comment[];
+}
+
 // Timeline item - discriminated union for unified conversation view
 export type TimelineItem =
   | { type: 'message'; data: Message; timestamp: number }
