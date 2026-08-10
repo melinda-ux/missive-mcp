@@ -12,6 +12,20 @@ import {
 const BASE_URL = 'https://public.missiveapp.com/v1';
 const REQUEST_TIMEOUT = 30000;
 
+// Missive's documented limits: 300 requests/min (5/sec), 900/15min, 5 concurrent.
+// For continuous polling (which is what mentions-scanning and any multi-conversation
+// tool call does) Missive's own guidance is to stay around 1 request/second rather
+// than bursting near the ceiling — bursting invites 429s under real-world jitter,
+// especially now that more than one client (ClickUp, Jarvis, ...) can call this
+// server against the same token.
+const MIN_REQUEST_INTERVAL_MS = 1000;
+const MAX_RATE_LIMIT_RETRIES = 3;
+const DEFAULT_RETRY_AFTER_SECONDS = 5;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   body?: unknown;
@@ -20,6 +34,14 @@ interface RequestOptions {
 
 export class MissiveClient {
   private readonly token: string;
+
+  // Serializes outgoing requests so concurrent callers (e.g. Promise.all
+  // fetching comments + messages for one conversation) get spaced out rather
+  // than firing at once. Shared per-instance, and instances are cached
+  // per-token (see getClientForToken/getClient below), so this pacing is
+  // effectively per-token, matching how Missive's rate limit is scoped.
+  private requestQueue: Promise<void> = Promise.resolve();
+  private lastRequestAt = 0;
 
   constructor(token: string) {
     if (!token) {
@@ -31,6 +53,20 @@ export class MissiveClient {
     }
 
     this.token = token;
+  }
+
+  private pace(): Promise<void> {
+    const myTurn = this.requestQueue.then(async () => {
+      const wait = Math.max(0, this.lastRequestAt + MIN_REQUEST_INTERVAL_MS - Date.now());
+      if (wait > 0) {
+        await sleep(wait);
+      }
+      this.lastRequestAt = Date.now();
+    });
+    // Keep the chain alive even if this turn's caller ends up throwing later —
+    // the pacing slot itself always resolves.
+    this.requestQueue = myTurn.catch(() => {});
+    return myTurn;
   }
 
   private async request<T>(
@@ -54,44 +90,57 @@ export class MissiveClient {
       }
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    for (let attempt = 0; ; attempt++) {
+      await this.pace();
 
-    try {
-      const response = await fetch(url, {
-        method,
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          'Content-Type': 'application/json',
-        },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-      if (!response.ok) {
-        await this.handleErrorResponse(response);
-      }
+      try {
+        const response = await fetch(url, {
+          method,
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+        });
 
-      if (response.status === 204) {
-        return {} as T;
-      }
-
-      return (await response.json()) as T;
-    } catch (error) {
-      if (error instanceof MissiveAPIError) {
-        throw error;
-      }
-      if (error instanceof Error) {
-        if (error.name === 'AbortError') {
-          throw new MissiveAPIError('Request timeout', 408, 'TIMEOUT');
+        if (!response.ok) {
+          await this.handleErrorResponse(response);
         }
-        // Redact token from any error message
-        const safeMessage = error.message.replace(this.token, '[REDACTED]');
-        throw new MissiveAPIError(safeMessage, 500, 'UNKNOWN');
+
+        if (response.status === 204) {
+          return {} as T;
+        }
+
+        return (await response.json()) as T;
+      } catch (error) {
+        if (error instanceof RateLimitError && attempt < MAX_RATE_LIMIT_RETRIES) {
+          const waitSeconds = error.retryAfter ?? DEFAULT_RETRY_AFTER_SECONDS * (attempt + 1);
+          console.error(
+            `Missive API rate limited on ${path}; retrying in ${waitSeconds}s ` +
+              `(attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES})`
+          );
+          await sleep(waitSeconds * 1000);
+          continue;
+        }
+        if (error instanceof MissiveAPIError) {
+          throw error;
+        }
+        if (error instanceof Error) {
+          if (error.name === 'AbortError') {
+            throw new MissiveAPIError('Request timeout', 408, 'TIMEOUT');
+          }
+          // Redact token from any error message
+          const safeMessage = error.message.replace(this.token, '[REDACTED]');
+          throw new MissiveAPIError(safeMessage, 500, 'UNKNOWN');
+        }
+        throw new MissiveAPIError('Unknown error occurred', 500, 'UNKNOWN');
+      } finally {
+        clearTimeout(timeout);
       }
-      throw new MissiveAPIError('Unknown error occurred', 500, 'UNKNOWN');
-    } finally {
-      clearTimeout(timeout);
     }
   }
 
