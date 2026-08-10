@@ -19,6 +19,7 @@ import type { ClientResolver } from '../types/tools.js';
 import type {
   OrganizationsResponse,
   UsersResponse,
+  TeamsResponse,
   ConversationsResponse,
   CommentsResponse,
 } from '../types/missive.js';
@@ -139,62 +140,76 @@ Requires the person's email address (looked up against Missive's user list, cach
 
       let conversationsScanned = 0;
 
+      // Missive's /conversations endpoint requires an actual mailbox filter —
+      // `organization` alone isn't accepted ("You need to specify at least one
+      // mailbox"). `team_all` is the documented way to scope to a shared team
+      // inbox, but it takes exactly one team ID at a time, so we enumerate teams
+      // per organization and scan each team's "all" mailbox in turn.
       for (const organizationId of organizationIds) {
         if (conversationsScanned >= max_conversations) break;
 
-        let until: string | undefined;
-        let keepPaging = true;
+        const teamsData = await client.get<TeamsResponse>('/teams', {
+          organization: organizationId,
+          limit: 200,
+        });
 
-        while (keepPaging && conversationsScanned < max_conversations) {
-          const data = await client.get<ConversationsResponse>('/conversations', {
-            organization: organizationId,
-            limit: 50,
-            until,
-          });
+        for (const team of teamsData.teams) {
+          if (conversationsScanned >= max_conversations) break;
 
-          if (data.conversations.length === 0) break;
+          let until: string | undefined;
+          let keepPaging = true;
 
-          for (const convo of data.conversations) {
-            if (conversationsScanned >= max_conversations) break;
-            conversationsScanned++;
+          while (keepPaging && conversationsScanned < max_conversations) {
+            const data = await client.get<ConversationsResponse>('/conversations', {
+              team_all: team.id,
+              limit: 50,
+              until,
+            });
 
-            // Conversations come back newest-activity-first, so once we cross
-            // the cutoff there's nothing older left worth checking.
-            if (convo.last_activity_at < sinceCutoff) {
-              keepPaging = false;
-              break;
-            }
+            if (data.conversations.length === 0) break;
 
-            const commentsData = await client.get<CommentsResponse>(
-              `/conversations/${convo.id}/comments`,
-              { limit: 20 }
-            );
+            for (const convo of data.conversations) {
+              if (conversationsScanned >= max_conversations) break;
+              conversationsScanned++;
 
-            for (const comment of commentsData.comments) {
-              if (comment.created_at < sinceCutoff) continue;
-              const wasMentioned = comment.mentions?.some((m) => m.id === userId);
-              if (wasMentioned) {
-                mentions.push({
-                  conversation_id: convo.id,
-                  conversation_subject: convo.subject || convo.latest_message_subject,
-                  comment_id: comment.id,
-                  comment_body: comment.body,
-                  author: comment.author
-                    ? {
-                        id: comment.author.id,
-                        name: comment.author.name,
-                        email: comment.author.email,
-                      }
-                    : undefined,
-                  created_at: comment.created_at,
-                });
+              // Conversations come back newest-activity-first, so once we cross
+              // the cutoff there's nothing older left worth checking in this team.
+              if (convo.last_activity_at < sinceCutoff) {
+                keepPaging = false;
+                break;
+              }
+
+              const commentsData = await client.get<CommentsResponse>(
+                `/conversations/${convo.id}/comments`,
+                { limit: 20 }
+              );
+
+              for (const comment of commentsData.comments) {
+                if (comment.created_at < sinceCutoff) continue;
+                const wasMentioned = comment.mentions?.some((m) => m.id === userId);
+                if (wasMentioned) {
+                  mentions.push({
+                    conversation_id: convo.id,
+                    conversation_subject: convo.subject || convo.latest_message_subject,
+                    comment_id: comment.id,
+                    comment_body: comment.body,
+                    author: comment.author
+                      ? {
+                          id: comment.author.id,
+                          name: comment.author.name,
+                          email: comment.author.email,
+                        }
+                      : undefined,
+                    created_at: comment.created_at,
+                  });
+                }
               }
             }
-          }
 
-          if (!keepPaging || data.conversations.length < 50) break;
-          const last = data.conversations[data.conversations.length - 1];
-          until = String(last.last_activity_at);
+            if (!keepPaging || data.conversations.length < 50) break;
+            const last = data.conversations[data.conversations.length - 1];
+            until = String(last.last_activity_at);
+          }
         }
       }
 
