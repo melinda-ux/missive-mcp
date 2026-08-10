@@ -188,12 +188,25 @@ Requires the person's email address (looked up against Missive's user list, cach
           .describe(
             'Maximum recently-active conversations to scan PER TEAM (each team gets its own budget, so a busy team can\'t starve others out of being checked at all)'
           ),
+        scan_time_budget_ms: z
+          .number()
+          .min(10000)
+          .max(55000)
+          .default(45000)
+          .describe(
+            'Hard wall-clock cap on the whole scan, in milliseconds (default 45000 = 45s, chosen to stay under most callers\' timeouts). If the scan runs out of budget partway through, it stops and returns whatever it found so far with scan_truncated: true rather than running indefinitely — rerun (optionally with a smaller max_conversations_per_team) to pick up where it left off.'
+          ),
       },
     },
-    async ({ user_email, organization, since_minutes, max_conversations_per_team }, extra) => {
+    async (
+      { user_email, organization, since_minutes, max_conversations_per_team, scan_time_budget_ms },
+      extra
+    ) => {
       const client = getClient(extra);
       const sinceCutoff = Math.floor(Date.now() / 1000) - since_minutes * 60;
       const now = Math.floor(Date.now() / 1000);
+      const scanStartedAt = Date.now();
+      let scanTruncated = false;
 
       let organizationIds: string[];
       if (organization) {
@@ -237,13 +250,18 @@ Requires the person's email address (looked up against Missive's user list, cach
       // per organization and scan each team's "all" mailbox in turn. Each team
       // gets its own max_conversations_per_team budget so a busy team can't
       // crowd out quieter ones later in the list.
-      for (const organizationId of organizationIds) {
+      outer: for (const organizationId of organizationIds) {
         const teamsData = await client.get<TeamsResponse>('/teams', {
           organization: organizationId,
           limit: 200,
         });
 
         for (const team of teamsData.teams) {
+          if (Date.now() - scanStartedAt > scan_time_budget_ms) {
+            scanTruncated = true;
+            break outer;
+          }
+
           teamsScanned++;
           let scannedInTeam = 0;
 
@@ -251,6 +269,11 @@ Requires the person's email address (looked up against Missive's user list, cach
           let keepPaging = true;
 
           while (keepPaging && scannedInTeam < max_conversations_per_team) {
+            if (Date.now() - scanStartedAt > scan_time_budget_ms) {
+              scanTruncated = true;
+              break outer;
+            }
+
             const data = await client.get<ConversationsResponse>('/conversations', {
               team_all: team.id,
               limit: 50,
@@ -261,6 +284,10 @@ Requires the person's email address (looked up against Missive's user list, cach
 
             for (const convo of data.conversations) {
               if (scannedInTeam >= max_conversations_per_team) break;
+              if (Date.now() - scanStartedAt > scan_time_budget_ms) {
+                scanTruncated = true;
+                break outer;
+              }
               scannedInTeam++;
               conversationsScanned++;
 
@@ -271,10 +298,16 @@ Requires the person's email address (looked up against Missive's user list, cach
                 break;
               }
 
-              const [commentsInWindow, messagesInWindow] = await Promise.all([
-                fetchCommentsSince(client, convo.id, sinceCutoff),
-                fetchMessagesSince(client, convo.id, sinceCutoff),
-              ]);
+              // Comments are the only place a mention can occur, so always
+              // fetch those. Messages are only needed to check whether a
+              // found mention was answered by email instead of a comment —
+              // most conversations have no mention at all, so fetching
+              // messages eagerly for every conversation (as the previous
+              // version did) roughly doubled the request count for no
+              // benefit. Fetch lazily, once, the first time it's actually
+              // needed for this conversation.
+              const commentsInWindow = await fetchCommentsSince(client, convo.id, sinceCutoff);
+              let messagesInWindow: Message[] | undefined;
 
               for (const comment of commentsInWindow) {
                 const wasMentioned = comment.mentions?.some((m) => m.user_id === userId);
@@ -283,13 +316,18 @@ Requires the person's email address (looked up against Missive's user list, cach
                 const repliedWithComment = commentsInWindow.some(
                   (c) => c.author?.id === userId && c.created_at > comment.created_at
                 );
+                if (repliedWithComment) continue;
+
+                if (messagesInWindow === undefined) {
+                  messagesInWindow = await fetchMessagesSince(client, convo.id, sinceCutoff);
+                }
                 const repliedWithMessage = messagesInWindow.some(
                   (m) =>
                     m.from_field?.address?.toLowerCase() === user_email.toLowerCase() &&
                     (m.delivered_at || 0) > comment.created_at
                 );
 
-                if (repliedWithComment || repliedWithMessage) continue;
+                if (repliedWithMessage) continue;
 
                 unanswered.push({
                   conversation_id: convo.id,
@@ -330,6 +368,14 @@ Requires the person's email address (looked up against Missive's user list, cach
                 max_conversations_per_team,
                 teams_scanned: teamsScanned,
                 conversations_scanned: conversationsScanned,
+                scan_duration_ms: Date.now() - scanStartedAt,
+                scan_truncated: scanTruncated,
+                ...(scanTruncated && {
+                  scan_truncated_note:
+                    'Ran out of scan_time_budget_ms before finishing every team/conversation. ' +
+                    'Results below are real but may be incomplete — rerun (optionally with a ' +
+                    'smaller max_conversations_per_team) to cover what was skipped.',
+                }),
                 unanswered_mentions_found: unanswered.length,
                 unanswered_mentions: unanswered,
               },
