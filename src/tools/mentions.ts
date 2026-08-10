@@ -277,7 +277,7 @@ Requires the person's email address (looked up against Missive's user list, cach
               ]);
 
               for (const comment of commentsInWindow) {
-                const wasMentioned = comment.mentions?.some((m) => m.id === userId);
+                const wasMentioned = comment.mentions?.some((m) => m.user_id === userId);
                 if (!wasMentioned) continue;
 
                 const repliedWithComment = commentsInWindow.some(
