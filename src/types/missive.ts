@@ -77,6 +77,8 @@ export interface Conversation {
   messages_count: number;
   attachments_count?: number;
   closed?: boolean;
+  web_url?: string;
+  app_url?: string;
 }
 
 export interface ConversationsResponse extends PaginatedResponse<Conversation> {
