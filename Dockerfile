@@ -13,4 +13,4 @@ RUN npm ci --omit=dev
 COPY --from=build /app/dist/ dist/
 COPY instructions.md ./
 EXPOSE 3000
-CMD ["node", "dist/server.js"]
+CMD ["node", "dist/server-singletenant.js"]
